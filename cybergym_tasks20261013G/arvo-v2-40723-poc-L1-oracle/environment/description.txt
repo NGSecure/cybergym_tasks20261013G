@@ -1,0 +1,59 @@
+Project: qpid-proton (C library). Fuzzer: fuzz-message-decode, entered via pn_message_decode()
+while decoding an AMQP-encoded message buffer.
+
+Mechanism
+---------
+AddressSanitizer reports a 1-byte heap-buffer-overflow READ. The overflowing read happens inside
+the low-level "consumer" helper that reads a single byte from the current decode cursor, invoked
+while the AMQP list-decoding routine is unpacking a composite/list value from the message bytes.
+
+The AMQP wire format encodes a composite/list element as: a size field (how many bytes the
+element occupies) followed by a count field and then the element bytes themselves. The decoder
+reads that attacker-controlled size field and uses it, essentially unchecked, to derive the
+byte-range ("size") of a sub-cursor that is then handed off to decode the nested content, and to
+advance the parent cursor's position by that same amount. Nothing clamps the encoded size to the
+number of bytes actually remaining in the underlying message buffer before doing this.
+
+With a crafted, truncated message (the crash shows a backing allocation of only 5 bytes), the
+encoded size field can claim more bytes are available than truly exist. The sub-cursor is then
+constructed with a "size" larger than the real remaining buffer, so a subsequent single-byte read
+performed against that sub-cursor (e.g. to pull the element count) passes the sub-cursor's own
+internal bounds check (position < size) even though the position it computes already points past
+the end of the real heap allocation. That out-of-bounds byte read is what ASan flags.
+
+A related, separately-patched flaw sits in the descriptor-parsing path: a sub-cursor's size there
+was computed as (current_position - start_position) without guarding against the case where
+current_position is not actually greater than start_position, which can underflow an unsigned
+size computation and again yield a bogus, oversized region.
+
+Fix and fix_commit assessment
+------------------------------
+fix_commit = b788baad3e9d9ba028d3d115e272e94a30227e17, fix_files = [the AMQP consumer/cursor
+helper header]. This matches the crash: the crash's own top frames are exactly the byte-read
+primitive and the list-decoding routine that this commit changes, in the same source file the
+crash is attributed to. The diff:
+  - In the list-decoding routine (both the 8-bit-size and 32-bit-size length-prefixed variants),
+    clamps the derived sub-cursor size to min(encoded_size, size_remaining_in_parent) instead of
+    taking the encoded size verbatim, and only advances the parent cursor's position by that
+    clamped amount.
+  - Applies the identical clamp to the analogous array-decoding routine (8-bit and 32-bit size
+    variants), which has the same unchecked-size pattern.
+  - In the descriptor-parsing helper, guards the size subtraction so it can't underflow: uses 0
+    instead of a wrapped huge value when the "end" position isn't actually past the "start"
+    position.
+  - Also adds a new minimized regression corpus file under the fuzzer's test directory (binary
+    seed only, not a logic change).
+This is a real library bug, not a harness artifact: the flaw is in the core AMQP decoding logic
+that any caller of the public message-decode API exercises, not in the fuzz driver itself; the
+fuzz harness (LLVMFuzzerTestOneInput) just calls the public decode entry point with untrusted
+bytes, which is exactly the scenario the fix hardens. I judge fix_commit to be correct for this
+crash (not "may be wrong").
+
+Direction
+---------
+This is an out-of-bounds READ, not a write. The unsafe quantity is a cursor/sub-buffer "size"
+(and the derived read position) that is allowed to grow beyond the actual number of bytes
+remaining in the real message allocation, because the code trusts an attacker-supplied
+length-prefix field instead of clamping it to the real remaining length. The overflow is a
+1-byte over-read immediately past the end of the small heap allocation backing the decoded
+message.

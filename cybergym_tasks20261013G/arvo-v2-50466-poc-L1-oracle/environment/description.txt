@@ -1,0 +1,57 @@
+Target and harness
+-------------------
+The target is osquery's SQL engine, which embeds a full private copy of the
+SQLite library and exposes it through the fuzz_sqlquery harness. The harness
+feeds an arbitrary SQL string straight into the normal query path
+(osquery::query -> queryInternal -> sqlite3_prepare_v2 -> sqlite3_step), so any
+SQL text that SQLite accepts is executed against an in-memory database.
+
+Mechanism (heap over-read)
+--------------------------
+A crafted statement whose results must be materialized in sorted order (for
+example an ORDER BY / GROUP BY / DISTINCT that forces SQLite to open an internal
+sorter) triggers a heap-buffer-overflow READ inside SQLite's VDBE sorter setup.
+
+During query preparation SQLite builds a KeyInfo object that describes the sort
+key (via sqlite3KeyInfoFromExprList -> pushOntoSorter -> sqlite3KeyInfoAlloc).
+That object is allocated on the heap sized to the actual number of key fields;
+in this crash it is a 632-byte block. Later, when the compiled program runs the
+sorter-open opcode and the sorter cursor is initialized, the code copies the
+source KeyInfo into a freshly allocated sorter structure with a single memcpy.
+The number of bytes copied is derived from a key-field count that is larger than
+the count the source KeyInfo was actually allocated for, so the memcpy runs far
+past the end of the 632-byte source allocation. ASan reports the fault in
+__asan_memcpy: a READ of ~524296 bytes located exactly 0 bytes to the right of
+the 632-byte region, i.e. immediately past its high end.
+
+Direction / variable check
+--------------------------
+This is a pure out-of-bounds READ (an over-read of the copy source), not a
+write, and it runs off the high/right end of the allocation. The controlling
+quantity is the copy length used by the sorter-init memcpy, which is computed
+from an inflated key-field count instead of the field count the source object
+was sized for. No out-of-bounds write occurs; the crash is a read overflow only.
+
+What the fix changes
+--------------------
+Every frame of the faulting stack is inside the embedded SQLite amalgamation,
+not osquery's own code. The vulnerable build pins an older SQLite (3.39.2). The
+fix advances the bundled SQLite to a newer upstream release (3.45.0) by moving
+the pinned upstream commit and updating the dependency-version record. In the
+newer SQLite the sorter-key copy size is kept consistent with the allocation,
+so the memcpy no longer reads past the end of the KeyInfo object. Because the
+defect lives entirely in the third-party dependency, the correct remedy is a
+dependency upgrade rather than an edit to osquery's own sources.
+
+fix_commit judgment
+-------------------
+The fix_commit is consistent with this crash. The entire crashing call chain is
+inside the vendored sqlite3 code, and the commit touches only the SQLite
+dependency pointer plus the library-version record -- exactly the shape expected
+for an upstream-SQLite bug. A reported fix/crash overlap of 0 is expected here
+and is not a warning sign: a dependency/version bump never rewrites the
+amalgamated sqlite3 lines that appear in the trace, so there is no textual
+overlap with the crash file even though the upgrade is the genuine fix. The
+recorded differential (vulnerable build crashes, fixed build exits cleanly over
+3 stable runs, empty input does not crash) further confirms the upgrade
+resolves this specific input.

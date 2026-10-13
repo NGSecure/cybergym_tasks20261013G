@@ -1,0 +1,1 @@
+In wolfMQTT (ASan), decoding a just-received MQTT packet's variable-length property section whose declared length disagrees with the bytes actually present makes the decoder advance past the end of the allocated receive buffer (1-byte heap overflow read).

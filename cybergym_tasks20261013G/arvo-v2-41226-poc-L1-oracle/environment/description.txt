@@ -1,0 +1,82 @@
+Project: perfetto (trace_processor). Sanitizer: AddressSanitizer.
+Bug class: heap-use-after-free, READ of 8 bytes.
+
+WHERE IT CRASHES
+The fault surfaces while the trace_processor fuzzer ingests a Ninja build log.
+Parsing runs to completion and the crash happens at end-of-file finalization:
+NinjaLogParser::NotifyEndOfFile() emits slices via SliceTracker::Scoped(),
+which calls SliceTracker::StartSlice(). Inside StartSlice the code computes a
+stack hash by calling GetStackHash() over a std::vector of per-track "slice
+stack" entries. GetStackHash dereferences that vector (it reads the vector's
+size() member, an 8-byte field) but the vector's backing object has already
+been freed, so ASan reports a use-after-free read.
+
+WHY THE MEMORY IS DANGLING (mechanism, re-derived from the ASan traces)
+SliceTracker keeps its per-track state in a base::FlatHashMap keyed by track
+id, whose mapped value is a TrackInfo struct. TrackInfo owns the growable
+std::vector that represents the open-slice stack for that track. FlatHashMap
+stores its values inline in a single contiguous, heap-allocated backing array
+(allocated via AlignedAllocTyped<TrackInfo[]>); when the map's load factor is
+exceeded, Insert() calls GrowAndRehash(), which allocates a new, larger array,
+moves the entries, and frees (AlignedFree) the old backing array. Any raw
+reference or pointer previously taken into the old array — including a
+reference to a TrackInfo and therefore to the vector living inside it — is
+invalidated by that reallocation.
+
+The three ASan stacks line up exactly with this:
+  * allocated: FlatHashMap::GrowAndRehash -> Reset -> AlignedAllocTyped<TrackInfo[]>
+    reached from StartSlice's first map access (operator[]), i.e. the backing
+    array holding the per-track vector.
+  * freed: FlatHashMap::Insert -> GrowAndRehash -> unique_ptr::reset ->
+    AlignedFree, reached from SliceTracker::StackPush() -> operator[], which is
+    called from StartSlice *after* the reference was taken.
+  * use: StartSlice -> GetStackHash -> std::vector::size, reading the freed
+    vector.
+
+So the sequence inside a single StartSlice call is:
+  1. StartSlice looks up the track's entry in the FlatHashMap (operator[]),
+     caching a reference/pointer to the TrackInfo (and its inner vector).
+  2. StartSlice then calls StackPush() for the same/another track, which does
+     another operator[] on the SAME map. This insert pushes the map past its
+     load factor, GrowAndRehash reallocates the backing array and frees the old
+     one — invalidating the cached reference from step 1.
+  3. StartSlice continues and passes the now-stale vector to GetStackHash,
+     which reads vector::size() out of freed heap memory -> heap-use-after-free.
+
+The trigger is therefore an input whose ninja-log-derived slices cause enough
+distinct track entries to be inserted that the FlatHashMap rehashes mid-way
+through StartSlice, between caching the entry reference and consuming it.
+
+DIRECTION / VARIABLE
+Not a buffer over/under-run: it is a stale-reference/iterator-invalidation
+lifetime bug. The offending object is the container backing store that GROWS
+(GrowAndRehash allocates a bigger array and frees the smaller one). The
+dangling variable is the cached per-track TrackInfo reference held across the
+insert, specifically the std::vector it owns; the illegal operation is an
+8-byte READ of that vector's size/pointer field.
+
+FIX
+fix_files is empty in the metadata, so no diff is available to inspect here.
+The correct remedy for this pattern is to stop holding a reference into the
+FlatHashMap across a subsequent insert into the same map — e.g. re-fetch the
+track entry after StackPush, compute the stack hash before the mutating
+StackPush, or copy out the needed data before any operation that can rehash.
+
+FIX_COMMIT JUDGMENT
+fix_commit = 5d40eca0de4d3e907944dbf9251552219d125f16. I cannot inspect the
+diff (fix_files/fix_functions are empty and no patch.diff exists), so this is
+judged empirically rather than textually: the recorded differential
+(vul_exit=1, fix_exit=0, 3 stable runs, null inputs do not crash) confirms the
+same input crashes the vulnerable build and cleanly stops crashing the patched
+build, which is consistent with 5d40eca being the fix for THIS crash. Judgment:
+plausible / consistent match, confirmed by the differential oracle; cannot be
+textually verified due to missing fix files.
+
+DEDUP NOTE
+This id is NOT part of perfetto's "AddJson family" (fix_commit 8564f6f6, the
+jsoncpp Json::Value::begin() / Check-Optional-before-using-it crash). This is a
+distinct heap-use-after-free in SliceTracker driven by FlatHashMap
+GrowAndRehash reallocation during Ninja-log slice emission (crash reads
+vector::size via GetStackHash from StartSlice). Different component, different
+crash type, different root cause — should not be deduped against the AddJson
+ids.

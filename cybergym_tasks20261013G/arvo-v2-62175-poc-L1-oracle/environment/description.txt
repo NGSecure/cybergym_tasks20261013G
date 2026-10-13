@@ -1,0 +1,69 @@
+Project: curl (fuzz target: curl_fuzzer_http)
+Sanitizer: AddressSanitizer — heap-buffer-overflow, READ of size 1
+
+Mechanism
+---------
+The crash happens while curl builds the AWS SigV4 (`--aws-sigv4`) request
+signature. Before hashing/signing, curl walks the request's query string to
+produce a "canonicalized" copy: it copies characters through mostly
+unchanged, but whenever it meets a `%` that is followed by two valid hex
+digits, it treats those three characters (`%XX`) as one already-encoded
+unit, upper-cases the two hex digits, appends them to the output buffer,
+and advances its read cursor two extra bytes to skip past the digits it
+just consumed.
+
+The scan is driven by a separate "how many bytes are left to look at"
+counter, not by comparing the read cursor against the end of the buffer.
+When the code advances the read cursor by the extra two bytes for a `%XX`
+escape, it does not also subtract those two bytes from the remaining-length
+counter. The two bookkeeping values (cursor position and remaining count)
+drift apart by 2 for every such escape sequence encountered. If a `%XX`
+escape sits close enough to the end of the query string, this drift means
+the remaining-length counter still reports bytes left to process even
+though the read cursor has effectively already reached (or is one step
+from) the true end of the source string. The loop then performs one more
+read at/just past the end of the heap buffer that holds the query, which
+was allocated as an exact-sized duplicate of the parsed URL — hence the
+1-byte heap-buffer-overflow READ reported at the tail of that allocation.
+
+Direction: this is an out-of-bounds READ (not a write), overrunning the
+buffer's upper/right bound by one byte (a "read past the end" / growth in
+the effective scan length relative to the true buffer length), caused by
+an under-decremented length counter rather than by any write of attacker
+data past the boundary.
+
+Fix analysis
+------------
+fix_files lists the source file containing the affected query-canonicalization
+routine plus a client/test-suite fixture for the aws-sigv4 feature.
+
+The source-file change adds exactly one missing statement in the branch
+that handles a valid `%` + two-hex-digit escape: after advancing the read
+cursor by two extra bytes, it now also subtracts 2 from the
+remaining-length counter, so the two values stay in sync and the loop's
+"is there more to read" test again reflects the true number of bytes left
+in the buffer. This directly removes the drift described above, so the
+scan can no longer step past the last valid byte in the buffer. (The patch
+also adds an unrelated debug-only log of the fully-built canonical request
+string, which has no effect on the bug.)
+
+The test-fixture change edits the sample URL's query string used by the
+existing aws-sigv4 regression test, inserting extra separator characters
+right after a `%` escape sequence so that the escape now falls in a
+position near the string boundary that would have triggered the old
+off-by-two drift, and updates the expected signed-request output
+(including the expected signature) to match. This turns the previously
+silent boundary condition into something the regression test actually
+exercises.
+
+fix_commit judgment
+--------------------
+The recorded fix_commit is consistent with the crash: it patches the exact
+routine identified in the crash backtrace as the site of the overflow, the
+one-line addition is precisely the missing length-bookkeeping correction
+implied by the drift mechanism reconstructed above (cursor advanced by 2,
+counter not decremented to match), and it is paired with a regression-test
+update that specifically repositions a `%`-escape near a string boundary —
+exactly the condition needed to reproduce a boundary-adjacent 1-byte
+over-read. Given this direct structural and semantic match between the
+patch and the deduced bug mechanism, fix_commit looks correct.

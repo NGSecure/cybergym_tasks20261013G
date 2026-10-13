@@ -1,0 +1,68 @@
+Project: htslib (CRAM decoder, hts_open_fuzzer harness)
+Sanitizer: AddressSanitizer
+Crash type: heap-buffer-overflow, READ of size 1
+
+WHAT HAPPENS
+------------
+While opening a malformed CRAM file, the decoder crashes with a 1-byte
+out-of-bounds heap READ. The read lands exactly 0 bytes to the right of a
+50-byte heap allocation, i.e. one byte past the end of that buffer.
+
+The overflowed buffer is the raw CRAM block data. It is allocated in
+cram_read_block() (cram/cram_io.c) when the compression header block is read
+in during cram_first_slice() / cram_next_slice(). Its size (50 bytes here) is
+taken from the block's declared/compressed length in the file, so an attacker
+fully controls how large this buffer is and what bytes it contains.
+
+The bad access occurs while parsing the compression header. In
+cram_decode_compression_header() (cram/cram_decode.c:466) the per-data-series
+codecs are instantiated through cram_decoder_init(). For a Huffman-coded data
+series, cram_huffman_decode_init() (cram/cram_codecs.c:2830) reads a sequence
+of variable-length integers out of the block buffer. It does this via
+uint7_get_64() (cram/cram_io.c:789), which in turn calls the LEB128-style
+varint reader in the bundled codecs submodule's varint header. That inner
+reader walks the buffer one byte at a time, consuming continuation bytes
+(high bit set) and advancing its cursor, stopping only when it sees a byte
+with the top bit clear.
+
+MECHANISM / ROOT CAUSE
+----------------------
+The varint reader has no end-of-buffer bound. cram_huffman_decode_init() hands
+it a pointer into the block data but does not (and the reader itself cannot)
+verify that another varint actually fits before the end of the 50-byte
+allocation. A crafted compression header can:
+  - declare more Huffman codes / symbols than the block actually contains, so
+    the parser keeps calling the varint reader after the real data is
+    exhausted, and/or
+  - place a truncated varint whose final byte still has the continuation bit
+    set right at the tail of the block.
+In either case the cursor is advanced to (or just past) the end of the
+allocation and the reader dereferences one more byte to test its continuation
+bit. That single dereference is the out-of-bounds READ. Direction: the read
+pointer GROWS forward past the upper end of the block buffer (a forward,
+read-only over-read of one byte), not a backward underflow and not a write.
+
+The two "[W::cram_decode_compression_header] Unrecognised key" warnings in the
+log confirm the input reaches and is being parsed by the compression-header
+decoder before it walks off the end.
+
+FIX
+---
+The fix is a bump of the bundled codecs submodule pointer (fix_files lists the
+submodule; the superproject patch only advances its git-submodule commit from
+11b5007f... to 2aca18b3...). The actual change lives inside that submodule's
+varint reader / its callers: the corrected version enforces an end-of-buffer
+limit so the LEB128 reader stops at the buffer boundary and reports a decode
+error instead of reading one byte past the allocation. After the fix the same
+truncated/over-declared header is rejected cleanly (fix build exits 0) rather
+than triggering ASan (vul build exits 1).
+
+FIX_COMMIT JUDGMENT
+-------------------
+fix_commit 28a980bba6f731f901906f57e5c1ee19f4155849 is consistent with this
+crash. Reasoning: the crash function lives in the bundled codecs submodule's
+varint header, fix_files is exactly that submodule, and the provided patch is
+a submodule-pointer bump (11b5007f -> 2aca18b3) of that same submodule -- i.e.
+the recorded fix updates precisely the component that contains the faulting
+varint reader. The differential (vul_exit=1, fix_exit=0, 3 stable runs) further
+supports the match. No reason to suspect the commit is wrong.

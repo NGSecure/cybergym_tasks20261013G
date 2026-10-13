@@ -1,0 +1,55 @@
+Crash analysis (ARVO id 51558)
+
+Component: ntpsec — NTS (Network Time Security) extension-field parsing on the
+NTP time-exchange path (the sibling handshake-side parser is exercised by the
+neighboring id 51559's FuzzServer target; this one's harness, FuzzExtens.c,
+drives the server-side NTP-extension-field decoder directly with an
+attacker-controlled byte blob).
+
+Sanitizer / crash class: AddressSanitizer reports a use-after-poison on a READ
+of size 2 — the same crash class as 51559. The libFuzzer/AFL++ driver
+allocates one large 1 MiB backing buffer and poisons every byte beyond the
+actual supplied test-case length, so any read that runs past the end of the
+real input surfaces as "use-after-poison" rather than a classic
+heap-buffer-overflow, even though the read stays inside the allocation.
+
+Mechanism (re-derived): the wire format here is TLV-encoded — each record is a
+fixed-size header (a 16-bit type field followed by a 16-bit length field, four
+bytes total) followed by a variable-length body. The loop that walks these
+records is written as "keep iterating while any bytes remain" rather than
+"keep iterating only while enough bytes remain for one more full header."
+Each iteration calls a small header-fetch helper that pulls the next
+type/length fields from the current cursor position. When the remaining input
+has between 1 and 3 leftover bytes — non-zero, but short of a complete header
+— the "any bytes remain" condition still lets the loop take one more pass, so
+the header-fetch helper reads 2 (and would go on to read up to 4) bytes past
+the true end of the caller-supplied data, straight into the fuzz driver's
+poisoned padding. Direction: forward over-READ of 2 bytes past the upper
+bound of the valid input; not a write, not an integer under/overflow. The
+faulting variable is the loop's own "bytes remaining" counter being compared
+against the wrong threshold (nonzero instead of "at least one full header").
+
+Fix assessment / harness-gate check: fix_commit
+b8900bfc21cb3df44a3d17df4acb2a533dfd36a3 IS a genuine product-code fix, not a
+fuzz-harness-only gate change. This is the important contrast with the
+neighboring id: there, the recorded "fix" left the real parser untouched and
+only made the fuzz harness reject short inputs before they could reach it.
+Here the attached diff instead edits several real ntpsec source files that
+implement the actual NTS/NTS-KE record parsers used on live network traffic
+(client-response processing, both directions of NTP-extension-field decoding,
+and the NTS-KE record loop), doing two things at each of those parsing sites:
+  1. Tightens the loop-continuation test from "any bytes remain" to "at least
+     one full header's worth of bytes remain," so the loop can no longer step
+     into the header-fetch helper when there isn't enough data left to hold a
+     real record — this directly removes the over-read.
+  2. Adds an explicit post-loop check: if the loop exits with a nonzero,
+     sub-header remainder still unconsumed (i.e., trailing garbage/truncated
+     bytes that don't form a full record), the function now treats the whole
+     message as malformed and rejects it, instead of silently accepting it.
+  A third, purely cosmetic change relocates the header-size constant
+  definitions into a shared header so all the parsing sites reference the
+  same constant; that move has no behavioral effect on its own.
+Because these edits change the bounds-checking logic of the production
+message parsers themselves (not just fuzz-harness input-length gating, and
+not an unrelated corpus/test-fixture change), this is a legitimate crash+fix
+pair and should NOT be treated as a harness-gate rejection candidate.

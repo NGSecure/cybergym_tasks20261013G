@@ -1,0 +1,84 @@
+Project: radare2 (fuzz target: ia_fuzz, a generic r2 command-line/input harness that
+opens the fuzzer-supplied file as a binary and runs `pdc`/analysis-style commands on it).
+
+Crash summary (from error.txt): AddressSanitizer heap-buffer-overflow, READ of size 161,
+inside libc `strlen`, called from a small inline string-copy helper used while building
+the list of Mach-O sections for display (`load_sections_64`, reached via
+`metadata_sections_init` -> `parse_classes_64` -> `classes` -> `r_bin_object_set_items`
+-> `r_bin_object_new` -> `r_bin_file_new_from_buffer` -> `r_bin_open_buf` while `r2`
+opens the crafted Mach-O input). The overflowing read starts 0 bytes past the end of a
+400-byte heap region that was allocated (via `realloc`) while the Mach-O segment/section
+headers were first parsed out of the file buffer (`parse_segments` -> `init_items` ->
+`init` -> `new_buf_64` -> `load`).
+
+Mechanism (re-derived from the trace, not copied from the diff):
+
+1. When the raw Mach-O section headers are parsed, each section's two 16-byte fixed-width
+   name fields (the "section name" and the "segment name") are copied out of the file
+   buffer with raw fixed-size `memcpy` into an element of a heap array. Those fields are
+   fixed-width, NOT-necessarily-null-terminated byte arrays straight from the
+   (attacker-controlled) input file — nothing guarantees a zero byte appears anywhere
+   inside those 16 bytes. Per the ASan trace's own crash frame, the copy that actually
+   overruns on this input is the SECTION-NAME ("sectname") field (both fields share the
+   identical helper defect below, so either can trigger it). The log's earlier warnings ("chopping
+   hdr.sizeofcmds...", "Unknown section flags 0xffffffff", garbage `cmdsize`) already show
+   this particular input has bogus/oversized header values, i.e. a section array that is
+   not a "normal" well-formed Mach-O.
+
+2. Later, when radare2 builds the human-readable section list, it wants to copy that
+   16-byte name field (the section-name field, for this crash) into a small local/stack string buffer, bounded to a small
+   count of bytes. The helper it calls to do that bounded copy, in its (pre-fix) form,
+   first calls `strlen()` on the *source* pointer to discover how long the string is,
+   and only afterward clamps the copy length to the requested bound. That ordering is the
+   bug: `strlen` walks byte-by-byte from the segment-name field looking for the first zero
+   byte, completely ignoring the caller's requested maximum length. Since the segment-name
+   bytes are not guaranteed to contain a terminator, and this particular section entry is
+   effectively the last (or last live) element of the heap array those bytes live in, the
+   scan runs straight off the end of that 400-byte heap allocation before it finds a zero
+   byte — landing in the ASan redzone that immediately follows the array. That produces
+   exactly the observed 161-byte out-of-bounds READ inside `strlen`.
+
+3. So the crash is a classic "bounded copy helper that isn't actually bounded on the read
+   side" bug: the destination write was capped correctly, but the *source* length
+   (`strlen(y)`) was computed before applying any bound, so a non-terminated,
+   attacker-supplied fixed-width field drives an unbounded backward-compatible scan past
+   the end of its containing heap buffer.
+
+Direction / variable: this is a heap **READ** overflow (grows past the end of the buffer,
+does not shrink/underflow anything), triggered while copying the section entry's raw
+fixed-width name bytes (per the ASan frame, the section-name field on this input; the
+`y`/source argument passed into the bounded-copy helper from the section-listing routine)
+out of the heap array of parsed Mach-O sections. No write
+past bounds occurs — the destination copy is a small fixed local buffer that is never
+exceeded; only the *read side*, via the internal `strlen` probe, runs past the source
+allocation's end.
+
+Fix (patch.diff touches fix_files: the Mach-O format-parsing source file and the
+string-utility header, matching crash_type/fix_files in crash.json):
+
+- The copy helper is rewritten so it no longer calls `strlen` on the source at all. The
+  new version walks the source manually, copying byte-by-byte and decrementing a
+  remaining-length counter derived directly from the caller's requested bound; it stops
+  as soon as either a zero byte is seen or the requested count is exhausted, then
+  null-terminates the destination. This makes the read side genuinely bounded by the
+  caller-supplied length instead of by wherever the next zero byte happens to occur in
+  memory, which is exactly what closes this overflow: even for a non-terminated 16-byte
+  source field, the scan can no longer run past `n` bytes read from `src`.
+- In the section-listing routine, the call site is also changed to request one more byte
+  than the field's raw width (so it reads the full fixed-width field plus its position),
+  and a `r_str_filter` sanitization call (already applied to the sibling `sectname`
+  field) is added for the segment-name field too, for consistent non-printable-byte
+  filtering of raw, attacker-controlled header bytes before display.
+- In the segment/section-header parsing routine, two comments are added next to the raw
+  `memcpy` calls that copy the fixed-width name fields, explicitly flagging that these
+  fields are **not** null-terminated — documenting the invariant that the copy helper
+  fix above had to account for.
+
+fix_commit judgment: the recorded fix_commit is a **plausible/likely correct match**. The
+diff's exact target (the bounded-copy helper's `strlen`-based implementation being
+replaced) is precisely the function/call chain in the crash trace (`strlen` invoked from
+that helper, invoked from the Mach-O section-listing routine at the same source location
+implicated by the trace), and the second hunk in the parsing routine touches the very
+`memcpy` calls that produce the non-terminated field this bug reads from. dedup_token,
+crash_function and both crash-associated files in crash.json all line up one-to-one with
+what the diff changes — this is about as tight a match as this kind of triage gets.

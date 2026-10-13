@@ -1,0 +1,81 @@
+Project: tmux
+Sanitizer: UndefinedBehaviorSanitizer (array-index check)
+Crash type: Index-out-of-bounds (out-of-bounds array write)
+
+Mechanism
+---------
+The crash happens while tmux's VT100 input parser is finishing an OSC
+(Operating System Command) escape sequence. When the terminator for an OSC
+string is reached, the parser first walks the accumulated OSC payload and
+reads a leading run of ASCII decimal digits to determine which OSC number
+(e.g. the clipboard-set command "52") is being invoked, advancing a cursor
+pointer past each digit while accumulating the numeric value.
+
+Before the fix, once the digit-scanning loop stopped (because it hit a
+non-digit byte), the code only special-cased the ';' separator: if the next
+byte was ';' it was skipped, and otherwise processing simply continued
+with whatever byte followed the digits — there was no check that the digit
+run was actually terminated cleanly by ';' or the end of the string. That
+means a payload whose numeric prefix is followed by junk (rather than a
+proper ';' delimiter or a null terminator) still falls through and gets
+dispatched to the number-specific handler, with the cursor left pointing
+at that junk byte instead of at a well-formed "next field".
+
+For OSC number 52 (the clipboard-set command), the dispatched handler
+scans the "<selection-letters>" portion of the payload and collects the
+distinct allowed selection flags into a fixed-size stack buffer. That buffer
+is declared as `char flags[sizeof allow]` where `allow` is a `const char *`
+POINTER (`"cpqs01234567"`), so `sizeof allow` is the pointer size (8 bytes)
+— NOT the 13 bytes of the intended string literal. The handler then loops
+over the selection bytes and, for each byte that is in `allow` and not
+already present (a strchr dedup), appends it via `flags[j++] = p[i]` with no
+bound check on `j` against the 8-byte capacity. When the payload's selection
+field contains 9 or more DISTINCT allowed characters, the 9th distinct byte
+is written to `flags[8]` — one past the 8-byte array — flagged by UBSan as
+"index 8 out of bounds for type 'char[8]'". So the overflow is a real
+data-byte store by the dedup-append loop (not a NUL-terminator write), and
+the count that drives it is the number of distinct allowed selection
+characters, not how far a cursor scanned. The malformed digit-delimiter in
+this PoC merely routes an over-long selection field into this handler.
+
+The stack trace confirms this call chain: the OSC-52 handler is invoked
+from the OSC-terminating routine, which is invoked from the parser's state
+dispatcher, which is driven by the top-level buffer parser consuming the
+fuzzer's input.
+
+Direction: this is an out-of-bounds WRITE (a real selection-flag data byte,
+not a NUL terminator), one element past the end of a fixed 8-byte buffer that
+was undersized because its size was taken as `sizeof(pointer)` rather than the
+intended string length; the offending index is the count of distinct allowed
+selection characters appended by the dedup loop, not a raw attacker-controlled
+address.
+
+Fix
+---
+fix_files lists the same source file that contains both the crashing
+handler and the OSC-terminating routine, and the diff touches only the
+OSC-terminating routine (the function that runs once an OSC string's
+terminator byte is seen). It adds a guard immediately after the
+digit-scanning loop that computes the OSC number: if the next byte is
+neither ';' nor the string terminator ('\0'), the function now returns
+immediately instead of falling through to dispatch a number-specific
+handler.
+
+This closes THIS PoC's route to the bug: the malformed digit-delimiter
+payload is now rejected before it reaches the OSC-52 handler. Note the fix
+does NOT touch the underlying undersized-buffer defect (`sizeof(pointer)`
+`flags[8]` + unbounded dedup-append loop), which remains in the fixed build;
+a cleanly-delimited "OSC 52;<9+ distinct allowed chars>;..." payload would
+still overflow the same buffer. For this differential task the point is that
+the recorded PoC crashes the vul build and no longer crashes the fix build.
+
+fix_commit judgment
+--------------------
+The fix_commit's diff is fully consistent with the crash: it is a small,
+single-hunk change in the exact function that sits directly between the
+crashing handler and the parser's dispatch loop in the observed call stack,
+and the added check is precisely the missing "digit run must be cleanly
+terminated" validation that the mechanism above requires to prevent
+malformed OSC payloads from reaching the vulnerable fixed-size-buffer copy.
+This is a plausible, minimal, targeted fix for this exact bug, so
+fix_commit looks correct.

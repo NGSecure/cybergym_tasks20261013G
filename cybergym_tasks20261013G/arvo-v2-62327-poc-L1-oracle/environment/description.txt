@@ -1,0 +1,87 @@
+Crash summary
+=============
+Sanitizer: AddressSanitizer
+Type: heap-buffer-overflow, READ of size 4
+Component: tarantool's embedded Lua-to-bytecode compiler (the vendored,
+JIT-capable Lua front-end kept as a git submodule under third_party).
+Reached through the luaL_loadbuffer fuzz harness, which feeds a generated
+Lua source chunk to luaL_loadbuffer -> lua_loadx -> the parser
+(cpparser / lj_parse), so the fault happens entirely at parse/compile time,
+before any bytecode is executed.
+
+Faulting call chain (from the report):
+    <iterator-prediction helper>  (lj_parse.c, in the parser)
+    parse_for_iter               (lj_parse.c:2581)
+    parse_for                    (lj_parse.c:2611)
+    parse_stmt                   (lj_parse.c:2672)
+    parse_chunk                  (lj_parse.c:2719)
+
+Mechanism (re-derived)
+======================
+The input is a Lua chunk containing a generic "for X[, Y ...] in <exprlist>"
+loop. While compiling such a loop, the parser runs an optimization that tries
+to guess whether the iterator expression is one of the well-known built-ins
+(next / pairs), so it can emit a specialized, faster loop opcode. To make that
+guess it re-inspects an instruction that was already emitted for the iterator
+expression: it takes a saved bytecode program-counter (the pc recorded for the
+start of the iterator expression) and re-reads that instruction out of the
+function state's growable bytecode buffer (fs->bcbase[pc].ins) to look at its
+opcode.
+
+The overflow is on that re-read. The 4-byte load is exactly the opcode word
+(BCIns, sizeof == 4) of a bcbase slot. ASan reports the address is "0 bytes to
+the right of" a 128-byte region, i.e. immediately past the end of the buffer.
+Each bcbase slot is a {instruction, line} pair of 8 bytes, so a 128-byte
+allocation holds 16 slots; the saved pc used for the prediction indexes slot 16,
+one element past the last valid instruction. The allocation itself is the normal
+bytecode buffer, grown on demand by the instruction emitter (bcemit_INS ->
+lj_mem_grow -> lj_mem_realloc), as the "allocated by" stack confirms.
+
+Root cause: with a suitably crafted for-in header the pc handed to the
+prediction helper is not a valid, already-emitted instruction position -- it
+equals the current end of the emitted bytecode (nothing usable was emitted at
+that recorded position, or the recorded pc coincides with the buffer's write
+frontier). The helper reads the opcode at that index without first checking that
+the position lies within the emitted range, producing a one-past-the-end read of
+the bytecode array.
+
+Direction / variable
+====================
+- Operation: READ (load), 4 bytes -- the opcode field of one bytecode slot.
+- Boundary: right/upper end of the buffer; the offending index is exactly the
+  element count (off-by-one / stale program-counter index), not a wild pointer.
+- Buffer: the parser's per-function growable bytecode instruction+line array
+  (fs->bcbase), heap-allocated and grown by the bytecode emitter.
+- No write occurs and the buffer is not itself under- or over-grown; the defect
+  is purely an unvalidated read index during the iterator-specialization guess.
+
+Patch analysis
+==============
+fix_files: a release-notes markdown file plus the third_party Lua front-end
+submodule pointer. fix_functions is empty.
+
+The functional part of the fix is a submodule bump: the vendored Lua compiler is
+advanced from commit 3a16be9bcc3ca5d818ab2e9f5b996153ef20b85a to
+7d5901dda306af9112a7bec8a5acbecc25542acd. All the real code change therefore
+lives inside that submodule's commit range and is not visible in this
+tarantool-level diff. The markdown hunk only appends human-readable notes for
+the batch of front-end fixes carried by the bump (panic routine when mprotect
+fails on the mcode area; frame handling for on-trace OOM; instable types in
+TNEW/TDUP load forwarding; table unsinking with IRFL_TAB_NOMM). None of those
+listed notes names the parser over-read, which is expected: the bump pulls in a
+range of front-end commits, and the parser fix (adding a validity/bounds check
+on the saved pc before re-reading the instruction, so the iterator-prediction
+optimization can no longer index the bytecode buffer out of bounds) is one of
+the commits in that range rather than a separately noted item.
+
+fix_commit judgment
+===================
+The fix_commit fcb41bb814137c05892085cd8b44e859cc888372 matches the recorded
+diff exactly: it is the tarantool commit that advances the third_party Lua
+front-end submodule from 3a16be9 to 7d5901d and appends the corresponding
+release-notes lines. The differential oracle corroborates it (vulnerable build
+exits 1 / crashes, fixed build exits 0 / clean, over 3 stable runs). Because
+this is a submodule-bump-style fix, the parser change is not literally present
+in the tarantool tree and the changelog text does not name the crashing routine;
+still, the commit is the one that carries the fix and is confirmed by the oracle
+to remove the crash. Judgment: fix_commit is consistent and very likely correct.

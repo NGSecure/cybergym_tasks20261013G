@@ -1,0 +1,74 @@
+Project: htslib (SAM/BAM/CRAM sequence-format library)
+Sanitizer: AddressSanitizer
+Crash type: heap-buffer-overflow (READ), size 232, 0 bytes to the right of a 512-byte heap region
+
+Summary
+-------
+The fuzz target opens an input alignment file and re-emits it as CRAM. While
+encoding each read, the CRAM writer walks the read's auxiliary (tag) data one
+tag at a time. A crafted record whose final string-valued tag is missing its
+terminating NUL byte causes an out-of-bounds READ that runs off the end of the
+heap buffer holding the copied record. It is a linear forward (grow-direction)
+over-read: bytes are read at increasing addresses past the right edge of the
+allocation, and the read length is unbounded because it stops only at whatever
+NUL byte happens to sit in adjacent heap memory (ASan observed 232 bytes here).
+
+Mechanism (re-derived)
+----------------------
+1. Allocation. For CRAM output the current record is duplicated via
+   bam_dup1 -> bam_copy1, which grows the destination record's data area
+   through realloc_bam_data / sam_realloc_bam_data (sam.c). In this reproducer
+   that backing buffer is exactly 512 bytes, sized to the record's data, with
+   no slack after the last aux byte.
+
+2. Tag walk. The CRAM auxiliary-tag encoding routine iterates the aux block
+   from `aux` up to `aux_end` (= start + aux_size). For string-valued tags
+   (RG:Z, MD:Z, and the generic printable/string codec path) the code assumes
+   each value is NUL-terminated inside the aux block. A well-formed record
+   always has that terminator; a malformed/truncated record can end the aux
+   block on the last value byte with no '\0'.
+
+3. The over-read. For the RG:Z tag the value pointer is handed straight to a
+   "%s" argument of the library's variadic logging helper (the "Missing @RG
+   header for RG \"%s\"" warning path). That helper forwards the pointer to the
+   C library's printf machinery, which scans for a NUL terminator to determine
+   the string length. Because the value is unterminated within the 512-byte
+   allocation, the scan walks past the end of the buffer -> heap-buffer-overflow
+   READ. The faulting frame is inside printf's format interceptor, reached
+   through the logging helper, called from the tag-encoding routine at the RG:Z
+   warning site. The same class of unterminated-value read is reachable on the
+   MD:Z path and on the generic string-codec path (which passes the value and a
+   computed length to the codec encoder).
+
+The out-of-bounds "variable" is the string pointer (the RG:Z / MD:Z / generic
+tag value) scanned forward by printf's %s; the root cause is the absent NUL
+terminator combined with no bounds check against `aux_end` before the value is
+consumed.
+
+The patch and what it fixes
+---------------------------
+fix_files lists the CRAM encoder source and fix_functions lists the aux-tag
+encoding routine; patch.diff modifies exactly that routine. Before consuming a
+string tag value it now advances a scanning pointer to `aux_end`
+(`while (aux < aux_end && *aux++);`) and then verifies a terminator was
+actually found: `if (aux == aux_end && aux[-1] != '\0')`. If the value ran to
+the end of the aux block without a NUL, it logs an "Unterminated ... tag" error
+and jumps to the error path (`goto err`) instead of using the value. This guard
+is added at three sites: the RG:Z branch (the crash site — the check is placed
+before sam_hrecs_find_rg / the "Missing @RG" warning, and the RG:Z scan is moved
+ahead of that branch), the MD:Z branch, and the generic string-tag branch that
+feeds the codec encoder. After the fix, an unterminated tag value is rejected up
+front, so no unterminated string is ever passed to printf's %s or to the codec,
+eliminating the over-read. This is a validation fix, not a memory-size fix; on
+the patched build the crafted input is rejected cleanly (fix_exit 0) while the
+vulnerable build crashes (vul_exit 1).
+
+fix_commit judgment
+-------------------
+The recorded fix_commit matches. patch.diff touches only the file named in
+fix_files and only the function named in fix_functions, and the guard it adds at
+the RG:Z warning branch is precisely the code path that produced the observed
+crash (unterminated RG:Z value forwarded to a %s logging call). The direction
+(forward heap over-READ of an unterminated aux string) and the crash location
+(variadic logging helper reached from the tag-encoding routine) are both fully
+explained by the diff. No reason to suspect a wrong fix_commit.

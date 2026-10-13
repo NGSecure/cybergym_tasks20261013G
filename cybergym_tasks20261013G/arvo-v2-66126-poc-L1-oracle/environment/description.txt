@@ -1,0 +1,68 @@
+Project: upx (Ultimate Packer for eXecutables). Sanitizer: AddressSanitizer.
+Crash type: SEGV / wild-address READ (SCARINESS 20). The signal is caused by a
+READ memory access on a bogus, near-null pointer (fault address ~0x94ff).
+
+How it is reached
+-----------------
+The finding comes from the test_packed_file_fuzzer harness, which asks UPX to
+verify (test) an attacker-supplied "packed" 32-bit ELF file. The test operation
+drives the ELF32 decompression logic, which for a shared-library layout walks the
+dynamic symbol table and, per symbol, adjusts absolute addresses. That
+per-symbol adjustment helper compares each dynamic symbol's name against known
+names with strcmp. The crash is the strcmp dereferencing a name pointer that
+points into unmapped memory.
+
+Root cause / mechanism (re-derived)
+-----------------------------------
+Before reaching the symbol walk, the ELF32 decompression routine decides the
+on-disk header layout for ET_EXEC inputs. The buggy code selected the ancient
+"old style, 8-byte b_info" block-header layout purely from two attacker-visible
+fields: it took that branch whenever the ELF entry point (e_entry) was below
+0x401180 and the machine was EM_386. Nothing checked the packer format version
+recorded in the packed stream.
+
+A crafted file can trivially satisfy both conditions (small e_entry, EM_386)
+while actually using a modern block-header layout (12-byte b_info). Misjudging
+the layout size mis-parses every subsequent compressed block: block sizes and
+offsets are read from the wrong byte positions, so the reconstructed structures
+and the buffers the later stages index into are populated with garbage. When
+control reaches the shared-library de-relocation stage and iterates the dynamic
+symbols, the symbol / symbol-name pointer handed to the address-adjustment
+helper is computed from this corrupted state and lands on a wild address. strcmp
+then performs an out-of-bounds READ of that string and the process receives a
+SEGV.
+
+Direction: this is a READ, not a write. Nothing is grown or overflowed by the
+program itself; instead a pointer (the dynamic-symbol name pointer consumed by
+the address-adjustment helper / strcmp) is derived from a mis-sized,
+mis-positioned header parse and points outside any valid mapping, so the read
+faults. The controlling variable is the misclassified b_info header size, driven
+by the unguarded e_entry/e_machine heuristic.
+
+The fix
+-------
+The patch adds a packer-format-version guard to that layout heuristic in both the
+Elf32 and Elf64 decompression routines. The old-style 8-byte b_info branch is now
+taken only when `ph.version <= 11` (the 2001-era formats that genuinely used the
+smaller header) in addition to the existing e_entry/e_machine test:
+
+    if (ph.version <= 11
+    &&  get_te32(&ehdri.e_entry) < 0x401180
+    &&  get_te16(&ehdri.e_machine)==Elf32_Ehdr::EM_386) { ... 8-byte b_info ... }
+
+Modern inputs (ph.version > 11) can no longer be forced down the old 8-byte path
+just by presenting a low entry point on x86, so the header is parsed with the
+correct size, the block offsets stay consistent, and the dynamic-symbol walk no
+longer dereferences a wild name pointer. The added comments cite the two 2001
+commits that fixed ph.version at 11 with/without b_info, confirming 11 as the
+correct cutoff.
+
+fix_commit judgment
+-------------------
+Plausible / consistent match. The recorded fix touches exactly the file and the
+Elf32/Elf64 decompression routine on the crash's call chain, and the guard it
+adds directly removes the misclassification that produces the corrupted parse and
+the wild-address strcmp seen in the crash. crash.json's fix_files (the Linux ELF
+packer source) and fix_functions (the decompression routine) line up with the
+diff, and the crash's address-adjustment helper is invoked from that routine's
+shared-library stage. No reason to suspect the fix_commit is wrong.
