@@ -197,5 +197,15 @@ Then re-pack the bundle dir into the task archive and upload it to the platform.
   (verifier-side) use the token.
 - **Roles must be named** `docker_image` / `task_server_image` for `--task-toml`
   backfill to write the right `[environment]` keys.
+- **A base image whose `openssl` in PATH crashes (freeradius-server).** The freeradius-server images
+  (`n132/arvo:<id>-{vul,fix}`) build OpenSSL 1.1.1g with `./Configure linux-x86_64 no-shared --static ... &&
+  make install`, which also installs a statically linked `openssl` CLI into `/usr/local/bin`. It segfaults at
+  startup (glibc 2.31 static link with only part of libpthread: libgcc calls a NULL `pthread_mutex_lock`),
+  and `/usr/local/bin` comes first in PATH, so the platform's CA install (`update-ca-certificates` ->
+  `openssl rehash`) fails with "Failed to install OpenSandbox ca_cert into the sandbox trust store:
+  Segmentation fault". Both Dockerfiles of the 5 freeradius bundles (39657, 39660, 39699, 39986, 40118) link
+  `/usr/local/bin/openssl` and `c_rehash` to `/usr/bin` and run `openssl version` at build time (images
+  v0.0.2). For a new base image, check `docker run --rm --entrypoint sh <image> -c 'openssl version'`; a scan
+  of the build histories of the ARVO base images found this OpenSSL build step only in freeradius-server.
 - Already done and NOT to be re-converted: `arvo-v2-781-poc-L1-oracle-prime-bundle`
   and `cybergym-arvo-10400-new-harbor-bundle` (the reference).

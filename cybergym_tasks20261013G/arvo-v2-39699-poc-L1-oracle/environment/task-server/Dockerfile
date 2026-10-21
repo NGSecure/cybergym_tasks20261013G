@@ -27,6 +27,16 @@ RUN mkdir -p /tests \
 # Clean up originals
 RUN rm -rf /out /tmp/poc
 
+# The base image's own build installed a statically linked OpenSSL 1.1.1g CLI into /usr/local/bin
+# (./Configure linux-x86_64 no-shared --static ... && make install). It crashes at startup (glibc 2.31
+# static link with only part of libpthread: a NULL pthread_mutex_lock), and /usr/local/bin comes first
+# in PATH, so anything that runs `openssl` (update-ca-certificates, the platform's CA install) segfaults.
+# Point it and c_rehash at the system's working tools; /usr/local/lib/libcrypto.a, libssl.a and the
+# headers stay, so the project still builds as before.
+RUN ln -sf /usr/bin/openssl /usr/local/bin/openssl \
+ && if [ -x /usr/bin/c_rehash ]; then ln -sf /usr/bin/c_rehash /usr/local/bin/c_rehash; else rm -f /usr/local/bin/c_rehash; fi \
+ && openssl version
+
 COPY task_server.py /task_server.py
 
 EXPOSE 9111
