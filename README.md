@@ -26,3 +26,7 @@
   `/src` 下没有 `.git`、`.hg`（旧镜像的 `/tmp/poc` 与标准答案逐字节相同；8867 旧镜像的 `/src/capstonemaster` 里能看到 2,930 个比漏洞版本新的提交）；
   783 的完整评测结果与修改前一致（标准答案 reward=1，空 PoC reward=0），在新镜像里从 `repo-vul.tar.gz` 编译 pcre2 和 fuzzer、复现崩溃都正常；freeradius 的 bundle 构建时的 `openssl version` 检查照常通过。
   请对本仓库的 bundle 重新运行 `build.sh` 和 `push.sh`（两个镜像都用新标签）。
+
+- **2026-10-28：新增 `collection_fix_cheat/`。** 平台上 reward=1、但轨迹用了泄露的参考答案（`/tmp/poc`）或修复提交（`/src` 下残留的 git 历史）的
+  257 个 bundle，放的是修复后的版本（来自 11 个 `cybergym_tasks*` 仓库和 `Evalhub_Data`），供重新构建、推送和评测；判定方法、类别和清单见
+  `collection_fix_cheat/README.md`、`collection_fix_cheat/bundles.csv`。
