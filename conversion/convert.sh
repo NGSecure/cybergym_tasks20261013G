@@ -17,6 +17,8 @@
 #   5. environment/oracle/             removed (dead once compose no longer uses it)
 #   6. <bundle>/build.sh + push.sh     generated (public-net build / upload-net
 #                                      push); params pre-filled, creds from env
+#   9. environment/Dockerfile          also drops the base image's /tmp/poc (the
+#                                      reference PoC) and the git/hg history under /src
 #
 # The AUTH_TOKEN reused is the bundle's own ORACLE_TOKEN, so it already matches
 # across task-server env and the verifier. solution/solve.sh is left as-is (it
@@ -77,4 +79,9 @@ if [ -f "$BUNDLE/task.toml" ]; then
   python3 "$HERE/strip_agent_net.py" "$BUNDLE/task.toml"
 fi
 
-echo "  done: task-server/, docker-compose.yaml, submit.sh, tests/{test.sh,verify.py}, build.sh, push.sh, instruction.md, task.toml([agent] net stripped); oracle/ removed"
+# --- 9. keep the reference PoC and the upstream fix out of the agent image ----
+# n132/arvo:<id>-vul keeps ARVO's reproducer at /tmp/poc (the PoC solution/solve.sh
+# writes) and the full git/hg history of the checkouts left under /src. Idempotent.
+python3 "$HERE/harden_agent_dockerfile.py" "$BUNDLE/environment/Dockerfile"
+
+echo "  done: task-server/, docker-compose.yaml, submit.sh, tests/{test.sh,verify.py}, build.sh, push.sh, instruction.md, task.toml([agent] net stripped), Dockerfile(/tmp/poc + VCS history dropped); oracle/ removed"

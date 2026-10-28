@@ -65,6 +65,7 @@ contract and its images built locally and pushed to SWR.
 | `task.toml` `[environment]` (no images) | `+ docker_image` `+ task_server_image` | filled by `newplatform push --task-toml` |
 | `task.toml` `[agent]` network_mode/allowed_hosts | **removed** | platform injects network policy externally; bundles must not declare it |
 | `instruction.md` (leading shared-placeholder comment) | fixed PoC-task preamble prepended, placeholder dropped | see **instruction.md preamble** below |
+| `environment/Dockerfile` (main sandbox, `FROM n132/arvo:<id>-vul`) | `+ RUN rm -f /tmp/poc`, `+` .git/.hg under /src removed | the base image's `/tmp/poc` is the reference PoC; see **Invariants** |
 
 **Token:** reuse the bundle's own `ORACLE_TOKEN` (from the prime compose) as the
 `AUTH_TOKEN`, so the task-server env and the verifier already agree.
@@ -207,5 +208,16 @@ Then re-pack the bundle dir into the task archive and upload it to the platform.
   `/usr/local/bin/openssl` and `c_rehash` to `/usr/bin` and run `openssl version` at build time (images
   v0.0.2). For a new base image, check `docker run --rm --entrypoint sh <image> -c 'openssl version'`; a scan
   of the build histories of the ARVO base images found this OpenSSL build step only in freeradius-server.
+- **The agent image must not inherit the answer or the fix.** `n132/arvo:<id>-vul` keeps ARVO's
+  reproducer for the bug at `/tmp/poc`, byte-identical to the PoC `solution/solve.sh` writes and readable
+  by any user; agents on the platform found it and submitted it. The checkouts that stay under `/src`
+  once the project directory is removed (dependencies such as zlib or libjpeg-turbo, a second copy of
+  the project such as capstonemaster) keep their full git/hg history, cloned in 2024, so it runs past
+  the vulnerable commit to the upstream fix, and agents read fix commits from it.
+  `conversion/harden_agent_dockerfile.py` (step 9 of `convert.sh`) adds `RUN rm -f /tmp/poc` and
+  `RUN find /src \( -name .git -o -name .hg \) -prune -exec rm -rf {} +` after the Dockerfile's rm step;
+  the source trees stay, so the agent can still build. Grading is unaffected: the task-server is built
+  from its own copy of the base image. Every bundle here got this on 2026-10-28 with its image tag
+  bumped (v0.0.1 -> v0.0.2; the freeradius bundles, if any, v0.0.2 -> v0.0.3).
 - Already done and NOT to be re-converted: `arvo-v2-781-poc-L1-oracle-prime-bundle`
   and `cybergym-arvo-10400-new-harbor-bundle` (the reference).

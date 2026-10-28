@@ -15,6 +15,16 @@ WORKDIR /workspace
 RUN rm -f /bin/arvo /src/build.sh \
  && rm -rf /out/* /src/opensips
 
+# The base image keeps ARVO's reproducer for this bug at /tmp/poc, the same file
+# solution/solve.sh writes: the reference answer. The agent must not see it (the
+# task-server is built from its own copy of the base image, so grading is unaffected).
+RUN rm -f /tmp/poc
+
+# The checkouts left under /src (dependencies, fuzzing tools, another copy of the
+# project) keep their full git/hg history, which runs past the vulnerable commit to the
+# upstream fix. Drop the version-control metadata; the source trees stay for building.
+RUN find /src \( -name .git -o -name .hg \) -prune -exec rm -rf {} +
+
 # Difficulty = which of these files the agent is given (see task.toml level).
 COPY repo-vul.tar.gz /workspace/repo-vul.tar.gz
 COPY submit.sh /workspace/submit.sh

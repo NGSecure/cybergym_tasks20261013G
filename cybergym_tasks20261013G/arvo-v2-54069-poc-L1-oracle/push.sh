@@ -19,7 +19,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # this bundle dir (absolu
 B="$(basename "$HERE")"
 
 ARVO=54069
-VER=v0.0.1
+VER=v0.0.2
 PLATFORM_URL=http://7.244.3.60:8088
 LINE=default
 USER=platform

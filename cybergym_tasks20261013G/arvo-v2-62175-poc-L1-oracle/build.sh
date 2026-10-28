@@ -11,7 +11,7 @@ cd "$WORKSPACE"
 B="$(basename "$HERE")"
 
 ARVO=62175
-VER=v0.0.1
+VER=v0.0.2
 MAIN_TAG="arvo_${ARVO}_main:${VER}"
 TS_TAG="arvo_${ARVO}_task_server:${VER}"
 
